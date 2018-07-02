@@ -1,34 +1,33 @@
-#!/usr/bin/env python
-""" Translator Class and builder """
-from __future__ import print_function
 import argparse
+import torch
 import codecs
 import os
 import math
+import torch.nn as nn
 
-import torch
-
+from torch.autograd import Variable
 from itertools import count
 
-import onmt.model_builder
-import onmt.translate.beam
-import onmt.inputters as inputters
-import onmt.opts as opts
+import onmt.ModelConstructor
+import onmt.translate.Beam
+import onmt.io
+import onmt.opts
 
 
-def build_translator(opt, report_score=True, logger=None, out_file=None):
+def make_translator(opt, report_score=True, out_file=None, report_bleu=True, report_rouge = True):
     if out_file is None:
-        out_file = codecs.open(opt.output, 'w+', 'utf-8')
+        out_file = codecs.open(opt.output, 'w', 'utf-8')
+        output_file = opt.output
 
     if opt.gpu > -1:
         torch.cuda.set_device(opt.gpu)
 
     dummy_parser = argparse.ArgumentParser(description='train.py')
-    opts.model_opts(dummy_parser)
+    onmt.opts.model_opts(dummy_parser)
     dummy_opt = dummy_parser.parse_known_args([])[0]
 
     fields, model, model_opt = \
-        onmt.model_builder.load_test_model(opt, dummy_opt.__dict__)
+        onmt.ModelConstructor.load_test_model(opt, dummy_opt.__dict__)
 
     scorer = onmt.translate.GNMTGlobalScorer(opt.alpha,
                                              opt.beta,
@@ -38,13 +37,12 @@ def build_translator(opt, report_score=True, logger=None, out_file=None):
     kwargs = {k: getattr(opt, k)
               for k in ["beam_size", "n_best", "max_length", "min_length",
                         "stepwise_penalty", "block_ngram_repeat",
-                        "ignore_when_blocking", "dump_beam", "report_bleu",
-                        "data_type", "replace_unk", "gpu", "verbose"]}
+                        "ignore_when_blocking", "dump_beam",
+                        "data_type", "replace_unk", "gpu", "verbose", "stochastic", "temperature"]}
 
     translator = Translator(model, fields, global_scorer=scorer,
-                            out_file=out_file, report_score=report_score,
-                            copy_attn=model_opt.copy_attn, logger=logger,
-                            **kwargs)
+                            out_file=out_file, report_score=report_score, report_bleu = report_bleu, report_rouge = report_rouge,
+                            copy_attn=model_opt.copy_attn, **kwargs, output_file = output_file)
     return translator
 
 
@@ -65,7 +63,6 @@ class Translator(object):
        copy_attn (bool): use copy attention during translation
        cuda (bool): use cuda
        beam_trace (bool): trace beam search for debugging
-       logger(logging.Logger): logger.
     """
 
     def __init__(self,
@@ -76,7 +73,6 @@ class Translator(object):
                  max_length=100,
                  global_scorer=None,
                  copy_attn=False,
-                 logger=None,
                  gpu=False,
                  dump_beam="",
                  min_length=0,
@@ -94,8 +90,10 @@ class Translator(object):
                  report_bleu=False,
                  report_rouge=False,
                  verbose=False,
-                 out_file=None):
-        self.logger = logger
+                 out_file=None,
+                 output_file=None,
+                 stochastic=False, 
+                 temperature=1 ):
         self.gpu = gpu
         self.cuda = gpu > -1
 
@@ -123,7 +121,9 @@ class Translator(object):
         self.report_score = report_score
         self.report_bleu = report_bleu
         self.report_rouge = report_rouge
-
+        self.output_file = output_file
+        self.stochastic = stochastic
+        self.temperature = temperature
         # for debugging
         self.beam_trace = self.dump_beam != ""
         self.beam_accum = None
@@ -134,66 +134,23 @@ class Translator(object):
                 "scores": [],
                 "log_probs": []}
 
-    def translate(self,
-                  src_path=None,
-                  src_data_iter=None,
-                  tgt_path=None,
-                  tgt_data_iter=None,
-                  src_dir=None,
-                  batch_size=None,
-                  attn_debug=False):
-        """
-        Translate content of `src_data_iter` (if not None) or `src_path`
-        and get gold scores if one of `tgt_data_iter` or `tgt_path` is set.
+    def translate(self, src_dir, src_path, tgt_path,
+                  batch_size, attn_debug=False, stochastic = False, temperature = 1):
+        data = onmt.io.build_dataset(self.fields,
+                                     self.data_type,
+                                     src_path,
+                                     tgt_path,
+                                     src_dir=src_dir,
+                                     sample_rate=self.sample_rate,
+                                     window_size=self.window_size,
+                                     window_stride=self.window_stride,
+                                     window=self.window,
+                                     use_filter_pred=self.use_filter_pred)
 
-        Note: batch_size must not be None
-        Note: one of ('src_path', 'src_data_iter') must not be None
-
-        Args:
-            src_path (str): filepath of source data
-            src_data_iter (iterator): an interator generating source data
-                e.g. it may be a list or an openned file
-            tgt_path (str): filepath of target data
-            tgt_data_iter (iterator): an interator generating target data
-            src_dir (str): source directory path
-                (used for Audio and Image datasets)
-            batch_size (int): size of examples per mini-batch
-            attn_debug (bool): enables the attention logging
-
-        Returns:
-            (`list`, `list`)
-
-            * all_scores is a list of `batch_size` lists of `n_best` scores
-            * all_predictions is a list of `batch_size` lists
-                of `n_best` predictions
-        """
-        assert src_data_iter is not None or src_path is not None
-
-        if batch_size is None:
-            raise ValueError("batch_size must be set")
-        data = inputters.build_dataset(self.fields,
-                                       self.data_type,
-                                       src_path=src_path,
-                                       src_data_iter=src_data_iter,
-                                       tgt_path=tgt_path,
-                                       tgt_data_iter=tgt_data_iter,
-                                       src_dir=src_dir,
-                                       sample_rate=self.sample_rate,
-                                       window_size=self.window_size,
-                                       window_stride=self.window_stride,
-                                       window=self.window,
-                                       use_filter_pred=self.use_filter_pred)
-
-        if self.cuda:
-            cur_device = "cuda"
-        else:
-            cur_device = "cpu"
-
-        data_iter = inputters.OrderedIterator(
-            dataset=data, device=cur_device,
+        data_iter = onmt.io.OrderedIterator(
+            dataset=data, device=self.gpu,
             batch_size=batch_size, train=False, sort=False,
             sort_within_batch=True, shuffle=False)
-
         builder = onmt.translate.TranslationBuilder(
             data, self.fields,
             self.n_best, self.replace_unk, tgt_path)
@@ -204,35 +161,30 @@ class Translator(object):
         gold_score_total, gold_words_total = 0, 0
 
         all_scores = []
-        all_predictions = []
-
-        for batch in data_iter:
-            batch_data = self.translate_batch(batch, data)
-            translations = builder.from_batch(batch_data)
-
+        for batch in data_iter: #each batch contains 30 sent.
+            batch_data = self.translate_batch(batch, data, self.stochastic, self.temperature) #returns n_best predictions as well and compute their scores  based on log likelihood of words given model
+            translations = builder.from_batch(batch_data) 
             for trans in translations:
-                all_scores += [trans.pred_scores[:self.n_best]]
+                all_scores += [trans.pred_scores[0]]
                 pred_score_total += trans.pred_scores[0]
                 pred_words_total += len(trans.pred_sents[0])
+
                 if tgt_path is not None:
                     gold_score_total += trans.gold_score
                     gold_words_total += len(trans.gold_sent) + 1
-
+                    
                 n_best_preds = [" ".join(pred)
                                 for pred in trans.pred_sents[:self.n_best]]
-                all_predictions += [n_best_preds]
                 self.out_file.write('\n'.join(n_best_preds) + '\n')
                 self.out_file.flush()
 
                 if self.verbose:
                     sent_number = next(counter)
                     output = trans.log(sent_number)
-                    if self.logger:
-                        self.logger.info(output)
-                    else:
-                        os.write(1, output.encode('utf-8'))
+                    os.write(1, output.encode('utf-8'))
 
-                # Debug attention.
+
+                ## Debug attention.
                 if attn_debug:
                     srcs = trans.src_raw
                     preds = trans.pred_sents[0]
@@ -252,39 +204,21 @@ class Translator(object):
                     os.write(1, output.encode('utf-8'))
 
         if self.report_score:
-            msg = self._report_score('PRED', pred_score_total,
-                                     pred_words_total)
-            if self.logger:
-                self.logger.info(msg)
-            else:
-                print(msg)
+            self.out_file.write(self._report_score('\nPRED', pred_score_total, pred_words_total))
             if tgt_path is not None:
-                msg = self._report_score('GOLD', gold_score_total,
-                                         gold_words_total)
-                if self.logger:
-                    self.logger.info(msg)
-                else:
-                    print(msg)
+                self.out_file.write(self._report_score('\nGOLD', gold_score_total, gold_words_total))
                 if self.report_bleu:
-                    msg = self._report_bleu(tgt_path)
-                    if self.logger:
-                        self.logger.info(msg)
-                    else:
-                        print(msg)
+                    self.out_file.write(self._report_bleu(tgt_path))
                 if self.report_rouge:
-                    msg = self._report_rouge(tgt_path)
-                    if self.logger:
-                        self.logger.info(msg)
-                    else:
-                        print(msg)
+                    self._report_rouge(tgt_path)
 
         if self.dump_beam:
             import json
             json.dump(self.translator.beam_accum,
                       codecs.open(self.dump_beam, 'w', 'utf-8'))
-        return all_scores, all_predictions
-
-    def translate_batch(self, batch, data):
+        return all_scores
+    
+    def translate_batch(self, batch, data, stochastic = False, temperature = 1) :
         """
         Translate a batch of sentences.
 
@@ -298,10 +232,7 @@ class Translator(object):
         Todo:
            Shouldn't need the original dataset.
         """
-        with torch.no_grad():
-            return self._translate_batch(batch, data)
 
-    def _translate_batch(self, batch, data):
         # (0) Prep each of the components of the search.
         # And helper method for reducing verbosity.
         beam_size = self.beam_size
@@ -317,17 +248,17 @@ class Translator(object):
         beam = [onmt.translate.Beam(beam_size, n_best=self.n_best,
                                     cuda=self.cuda,
                                     global_scorer=self.global_scorer,
-                                    pad=vocab.stoi[inputters.PAD_WORD],
-                                    eos=vocab.stoi[inputters.EOS_WORD],
-                                    bos=vocab.stoi[inputters.BOS_WORD],
+                                    pad=vocab.stoi[onmt.io.PAD_WORD],
+                                    eos=vocab.stoi[onmt.io.EOS_WORD],
+                                    bos=vocab.stoi[onmt.io.BOS_WORD],
                                     min_length=self.min_length,
                                     stepwise_penalty=self.stepwise_penalty,
                                     block_ngram_repeat=self.block_ngram_repeat,
                                     exclusion_tokens=exclusion_tokens)
                 for __ in range(batch_size)]
-
+        
         # Help functions for working with beams and batches
-        def var(a): return torch.tensor(a, requires_grad=False)
+        def var(a): return Variable(a, volatile=True)
 
         def rvar(a): return var(a.repeat(1, beam_size, 1))
 
@@ -338,7 +269,7 @@ class Translator(object):
             return m.view(beam_size, batch_size, -1)
 
         # (1) Run the encoder on the src.
-        src = inputters.make_features(batch, 'src', data_type)
+        src = onmt.io.make_features(batch, 'src', data_type)
         src_lengths = None
         if data_type == 'text':
             _, src_lengths = batch.src
@@ -359,68 +290,77 @@ class Translator(object):
         memory_lengths = src_lengths.repeat(beam_size)
         dec_states.repeat_beam_size_times(beam_size)
 
-        # (3) run the decoder to generate sentences, using beam search.
-        for i in range(self.max_length):
-            if all((b.done() for b in beam)):
+        ## (3) run the decoder to generate sentences, using beam search.
+        for i in range(self.max_length): 
+            #print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+            #print("word "+ str(i))
+            if all((b.done() for b in beam)): #if top of beam is eos 
                 break
-
+    
             # Construct batch x beam_size nxt words.
-            # Get all the pending current beam words and arrange for forward.
+            # Get all the pending current beam words and arrange
+            
             inp = var(torch.stack([b.get_current_state() for b in beam])
-                      .t().contiguous().view(1, -1))
-
+                          .t().contiguous().view(1, -1)) #inp [1*beam_size x batch_size]
+        
             # Turn any copied words to UNKs
             # 0 is unk
             if self.copy_attn:
                 inp = inp.masked_fill(
-                    inp.gt(len(self.fields["tgt"].vocab) - 1), 0)
-
+                        inp.gt(len(self.fields["tgt"].vocab) - 1), 0)
+    
             # Temporary kludge solution to handle changed dim expectation
             # in the decoder
             inp = inp.unsqueeze(2)
-
+    
             # Run one step.
             dec_out, dec_states, attn = self.model.decoder(
-                inp, memory_bank, dec_states, memory_lengths=memory_lengths,
-                step=i)
-
+                    inp, memory_bank, dec_states, memory_lengths=memory_lengths)
             dec_out = dec_out.squeeze(0)
-
             # dec_out: beam x rnn_size
-
+    
             # (b) Compute a vector of batch x beam word scores.
             if not self.copy_attn:
                 out = self.model.generator.forward(dec_out).data
+                #print(out)
+                #print(out.exp().sum(dim = 1))
+                #print('probablities is ')
+                #print(out)
                 out = unbottle(out)
                 # beam x tgt_vocab
+                #size of out : x batch x vocab_size
+    
                 beam_attn = unbottle(attn["std"])
             else:
                 out = self.model.generator.forward(dec_out,
-                                                   attn["copy"].squeeze(0),
-                                                   src_map)
+                                                       attn["copy"].squeeze(0),
+                                                       src_map)
+    
                 # beam x (tgt_vocab + extra_vocab)
                 out = data.collapse_copy_scores(
-                    unbottle(out.data),
-                    batch, self.fields["tgt"].vocab, data.src_vocabs)
+                        unbottle(out.data),
+                        batch, self.fields["tgt"].vocab, data.src_vocabs)
                 # beam x tgt_vocab
                 out = out.log()
                 beam_attn = unbottle(attn["copy"])
-
+    
+    
             # (c) Advance each beam.
             for j, b in enumerate(beam):
+                #print("sentence "+ str(j))
                 b.advance(out[:, j],
-                          beam_attn.data[:, j, :memory_lengths[j]])
+                              beam_attn.data[:, j, :memory_lengths[j]],  self.stochastic)
                 dec_states.beam_update(j, b.get_current_origin(), beam_size)
+            i +=1
 
         # (4) Extract sentences from beam.
         ret = self._from_beam(beam)
         ret["gold_score"] = [0] * batch_size
         if "tgt" in batch.__dict__:
-            ret["gold_score"] = self._run_target(batch, data)
+            ret["gold_score"] = self._run_target(batch, data) #compute score
         ret["batch"] = batch
-
         return ret
-
+    
     def _from_beam(self, beam):
         ret = {"predictions": [],
                "scores": [],
@@ -433,7 +373,9 @@ class Translator(object):
                 hyp, att = b.get_hyp(times, k)
                 hyps.append(hyp)
                 attn.append(att)
-            ret["predictions"].append(hyps)
+            #print(hyps)
+            #print(scores)
+            ret["predictions"].append(hyps) #predicted sent
             ret["scores"].append(scores)
             ret["attention"].append(attn)
         return ret
@@ -444,8 +386,8 @@ class Translator(object):
             _, src_lengths = batch.src
         else:
             src_lengths = None
-        src = inputters.make_features(batch, 'src', data_type)
-        tgt_in = inputters.make_features(batch, 'tgt')[:-1]
+        src = onmt.io.make_features(batch, 'src', data_type)
+        tgt_in = onmt.io.make_features(batch, 'tgt')[:-1]
 
         #  (1) run the encoder on the src
         enc_states, memory_bank = self.model.encoder(src, src_lengths)
@@ -459,44 +401,60 @@ class Translator(object):
         dec_out, _, _ = self.model.decoder(
             tgt_in, memory_bank, dec_states, memory_lengths=src_lengths)
 
-        tgt_pad = self.fields["tgt"].vocab.stoi[inputters.PAD_WORD]
+        tgt_pad = self.fields["tgt"].vocab.stoi[onmt.io.PAD_WORD]
         for dec, tgt in zip(dec_out, batch.tgt[1:].data):
             # Log prob of each word.
             out = self.model.generator.forward(dec)
             tgt = tgt.unsqueeze(1)
             scores = out.data.gather(1, tgt)
             scores.masked_fill_(tgt.eq(tgt_pad), 0)
-            gold_scores += scores.view(-1)
+            gold_scores += scores
         return gold_scores
 
     def _report_score(self, name, score_total, words_total):
-        msg = ("%s AVG SCORE: %.4f, %s PPL: %.4f" % (
+        print("%s AVG SCORE: %.4f, %s PPL: %.4f" % (
             name, score_total / words_total,
             name, math.exp(-score_total / words_total)))
-        return msg
+        return("%s AVG SCORE: %.4f, %s PPL: %.4f" % (
+            name, score_total / words_total,
+            name, math.exp(-score_total / words_total)))
 
     def _report_bleu(self, tgt_path):
         import subprocess
-        base_dir = os.path.abspath(__file__ + "/../../..")
-        # Rollback pointer to the beginning.
-        self.out_file.seek(0)
-        print()
-
-        res = subprocess.check_output("perl %s/tools/multi-bleu.perl %s"
-                                      % (base_dir, tgt_path),
-                                      stdin=self.out_file,
+        path = os.path.dirname(os.path.dirname(os.path.split(os.path.realpath(__file__))[0]))
+        try:
+            assert os.path.exists((path))
+            assert os.path.exists(tgt_path)
+            assert os.path.exists(self.output_file)
+        except AssertionError as e:
+            print(e)
+            raise
+        res = subprocess.check_output("perl %s/tools/multi-bleu.perl %s < %s"
+                                      % (path, path + "/" +  tgt_path, path + "/" + self.output_file),
                                       shell=True).decode("utf-8")
-
-        msg = ">> " + res.strip()
-        return msg
+        #print("perl %s/tools/multi-bleu.perl %s < %s"
+                                      #% (path, path + "/" +  tgt_path, path + "/" + self.output_file))
+        print("\n>> " + res.strip())
+        return ("\n>> " + res.strip())
 
     def _report_rouge(self, tgt_path):
         import subprocess
-        path = os.path.split(os.path.realpath(__file__))[0]
+        path = os.path.dirname(os.path.dirname(os.path.split(os.path.realpath(__file__))[0]))
+        print(path)
+        print(path + tgt_path)
+        print(self.output_file)
+        try:
+            assert os.path.exists((path))
+            assert os.path.exists(tgt_path)
+            assert os.path.exists(self.output_file)
+        except AssertionError as e:
+            print(e)
+            raise        
         res = subprocess.check_output(
-            "python %s/tools/test_rouge.py -r %s -c STDIN"
-            % (path, tgt_path),
+            "python %s\tools\test_rouge.py -r %s -c STDIN"
+             % (path, tgt_path),
             shell=True,
-            stdin=self.out_file).decode("utf-8")
-        msg = res.strip()
-        return msg
+            stdin = self.output_file).decode("utf-8")
+        
+        print(res.strip())
+        return res.strip()

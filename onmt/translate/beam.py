@@ -1,6 +1,8 @@
 from __future__ import division
 import torch
-from onmt.translate import penalties
+import math
+from torch.autograd import Variable
+from onmt.translate import Penalties
 
 
 class Beam(object):
@@ -16,7 +18,6 @@ class Beam(object):
        cuda (bool): use gpu
        global_scorer (:obj:`GlobalScorer`)
     """
-
     def __init__(self, size, pad, bos, eos,
                  n_best=1, cuda=False,
                  global_scorer=None,
@@ -71,7 +72,8 @@ class Beam(object):
         "Get the backpointers for the current timestep."
         return self.prev_ks[-1]
 
-    def advance(self, word_probs, attn_out):
+    def advance(self, word_probs, attn_out, stochastic=False):
+   
         """
         Given prob over words for every last beam `wordLk` and attention
         `attn_out`: Compute and update the beam search.
@@ -84,20 +86,32 @@ class Beam(object):
         Returns: True if beam search is complete.
         """
         num_words = word_probs.size(1)
+        #print(word_probs)
+        #print(word_probs.exp().sum(dim = 1))   #it is 1           
+
         if self.stepwise_penalty:
             self.global_scorer.update_score(self, attn_out)
+            
         # force the output to be longer than self.min_length
         cur_len = len(self.next_ys)
         if cur_len < self.min_length:
             for k in range(len(word_probs)):
                 word_probs[k][self._eos] = -1e20
+                
         # Sum the previous scores.
-        if len(self.prev_ks) > 0:
+        if len(self.prev_ks) > 0: ##for second word and after that
             beam_scores = word_probs + \
-                self.scores.unsqueeze(1).expand_as(word_probs)
+                self.scores.unsqueeze(1).expand_as(word_probs) 
+            #print(self.scores.unsqueeze(1).expand_as(word_probs))
+            #print("summing up")
+            #print(beam_scores)
+            
             # Don't let EOS have children.
+            ##It gives -1e20 to all words prob. 
             for i in range(self.next_ys[-1].size(0)):
-                if self.next_ys[-1][i] == self._eos:
+                #print(str(i) +" " + str(self.next_ys[-1][i]))
+                #print(self.next_ys)
+                if self.next_ys[-1][i] == self._eos: ## index(eos = </s>) is 3
                     beam_scores[i] = -1e20
 
             # Block ngram repeats
@@ -105,11 +119,11 @@ class Beam(object):
                 ngrams = []
                 le = len(self.next_ys)
                 for j in range(self.next_ys[-1].size(0)):
-                    hyp, _ = self.get_hyp(le - 1, j)
+                    hyp, _ = self.get_hyp(le-1, j)
                     ngrams = set()
                     fail = False
                     gram = []
-                    for i in range(le - 1):
+                    for i in range(le-1):
                         # Last n tokens, n = block_ngram_repeat
                         gram = (gram + [hyp[i]])[-self.block_ngram_repeat:]
                         # Skip the blocking if it is in the exclusion list
@@ -122,23 +136,51 @@ class Beam(object):
                         beam_scores[j] = -10e20
         else:
             beam_scores = word_probs[0]
+        
         flat_beam_scores = beam_scores.view(-1)
-        best_scores, best_scores_id = flat_beam_scores.topk(self.size, 0,
-                                                            True, True)
-
+            
+        if stochastic == True:
+            scores_weights = flat_beam_scores.exp()
+            sum1 = torch.FloatTensor([scores_weights.sum()])
+            if sum1.numpy()  == Variable(torch.FloatTensor([0])).data.numpy():
+                best_scores_id = torch.multinomial(flat_beam_scores.exp().add_(0.001), self.size) 
+                ##best_scores = scores_weights.index(best_scores_id).log()   ##by taking log of score -1e20 which is because of next_ys = eos the result is going to be -inf 
+                best_scores = flat_beam_scores[best_scores_id]
+                #print(flat_beam_scores)                
+                #print('best score id ' + str(best_scores_id))
+                #print('best score '  +str(flat_beam_scores[best_scores_id]))
+                #print('best score ' + str(best_scores))                
+            
+            else:   
+                best_scores_id = torch.multinomial(scores_weights, self.size) 
+                ##best_scores = torch.log(scores_weights.index(best_scores_id)) ##since we are taking exp for sampling we need to make the log
+                best_scores = flat_beam_scores[best_scores_id]
+                #print(flat_beam_scores)
+                #print(scores_weights.sum())                
+                #print(scores_weights)
+                #print('best score idd ' + str(best_scores_id))                
+                #print('best score '  +str(flat_beam_scores[best_scores_id]))
+                #print('best score ' + str(best_scores))
+                #print("min is "+ str(scores_weights.min()))
+                #print("max is "+ str(scores_weights.max()))                
+            
+        else:
+            best_scores, best_scores_id = flat_beam_scores.topk(self.size, 0,
+                                                                True, True)        
         self.all_scores.append(self.scores)
         self.scores = best_scores
 
         # best_scores_id is flattened beam x word array, so calculate which
         # word and beam each score came from
-        prev_k = best_scores_id / num_words
+        prev_k = best_scores_id / num_words ##???this is always 0
         self.prev_ks.append(prev_k)
         self.next_ys.append((best_scores_id - prev_k * num_words))
         self.attn.append(attn_out.index_select(0, prev_k))
         self.global_scorer.update_global_state(self)
+        #print("next_ys " + str(best_scores_id - prev_k * num_words)) 
 
         for i in range(self.next_ys[-1].size(0)):
-            if self.next_ys[-1][i] == self._eos:
+            if self.next_ys[-1][i] == self._eos: ##If the next_ys is <eos> the predicted sentence is done! (actually it calculates the next_ys untill the last word but after <eos>, it ignores the words after that in output)
                 global_scores = self.global_scorer.score(self, self.scores)
                 s = global_scores[i]
                 self.finished.append((s, len(self.next_ys) - 1, i))
@@ -147,7 +189,7 @@ class Beam(object):
         if self.next_ys[-1][0] == self._eos:
             self.all_scores.append(self.scores)
             self.eos_top = True
-
+            
     def done(self):
         return self.eos_top and len(self.finished) >= self.n_best
 
@@ -170,9 +212,10 @@ class Beam(object):
         """
         Walk back to construct the full hypothesis.
         """
+        ##Contains the list of predicted words indexes
         hyp, attn = [], []
         for j in range(len(self.prev_ks[:timestep]) - 1, -1, -1):
-            hyp.append(self.next_ys[j + 1][k])
+            hyp.append(self.next_ys[j+1][k])
             attn.append(self.attn[j][k])
             k = self.prev_ks[j][k]
         return hyp[::-1], torch.stack(attn[::-1])
@@ -187,11 +230,10 @@ class GNMTGlobalScorer(object):
        alpha (float): length parameter
        beta (float):  coverage parameter
     """
-
     def __init__(self, alpha, beta, cov_penalty, length_penalty):
         self.alpha = alpha
         self.beta = beta
-        penalty_builder = penalties.PenaltyBuilder(cov_penalty,
+        penalty_builder = Penalties.PenaltyBuilder(cov_penalty,
                                                    length_penalty)
         # Term will be subtracted from probability
         self.cov_penalty = penalty_builder.coverage_penalty()

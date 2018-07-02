@@ -1,9 +1,7 @@
-""" Translation main class """
 from __future__ import division, unicode_literals
-from __future__ import print_function
 
 import torch
-import onmt.inputters as inputters
+import onmt.io
 
 
 class TranslationBuilder(object):
@@ -21,7 +19,6 @@ class TranslationBuilder(object):
        replace_unk (bool): replace unknown words using attention
        has_tgt (bool): will the batch have gold targets
     """
-
     def __init__(self, data, fields, n_best=1, replace_unk=False,
                  has_tgt=False):
         self.data = data
@@ -33,19 +30,25 @@ class TranslationBuilder(object):
     def _build_target_tokens(self, src, src_vocab, src_raw, pred, attn):
         vocab = self.fields["tgt"].vocab
         tokens = []
+        #print(pred)
         for tok in pred:
+            #print('word_ind' + str(tok),end= ' ')
             if tok < len(vocab):
                 tokens.append(vocab.itos[tok])
+                #print(vocab.itos[tok],end= ' '),
             else:
                 tokens.append(src_vocab.itos[tok - len(vocab)])
-            if tokens[-1] == inputters.EOS_WORD:
+                #print(src_vocab.itos[tok - len(vocab)])
+            if tokens[-1] == onmt.io.EOS_WORD:
                 tokens = tokens[:-1]
+                #print(tokens[:-1], end=' '),
                 break
         if self.replace_unk and (attn is not None) and (src is not None):
             for i in range(len(tokens)):
-                if tokens[i] == vocab.itos[inputters.UNK]:
-                    _, max_index = attn[i].max(0)
-                    tokens[i] = src_raw[max_index[0]]
+                if tokens[i] == vocab.itos[onmt.io.UNK]:
+                    _, maxIndex = attn[i].max(0)
+                    tokens[i] = src_raw[maxIndex[0]]
+        #print('\n')
         return tokens
 
     def from_batch(self, translation_batch):
@@ -79,7 +82,7 @@ class TranslationBuilder(object):
         for b in range(batch_size):
             if data_type == 'text':
                 src_vocab = self.data.src_vocabs[inds[b]] \
-                    if self.data.src_vocabs else None
+                  if self.data.src_vocabs else None
                 src_raw = self.data.examples[inds[b]].src
             else:
                 src_vocab = None
@@ -88,7 +91,7 @@ class TranslationBuilder(object):
                 src[:, b] if src is not None else None,
                 src_vocab, src_raw,
                 preds[b][n], attn[b][n])
-                for n in range(self.n_best)]
+                          for n in range(self.n_best)]
             gold_sent = None
             if tgt is not None:
                 gold_sent = self._build_target_tokens(
@@ -120,7 +123,6 @@ class Translation(object):
         gold_score ([float]): log-prob of gold translation
 
     """
-
     def __init__(self, src, src_raw, pred_sents,
                  attn, pred_scores, tgt_sent, gold_score):
         self.src = src
@@ -133,23 +135,23 @@ class Translation(object):
 
     def log(self, sent_number):
         """
-        Log translation.
+        Log translation to stdout.
         """
-
         output = '\nSENT {}: {}\n'.format(sent_number, self.src_raw)
 
         best_pred = self.pred_sents[0]
         best_score = self.pred_scores[0]
         pred_sent = ' '.join(best_pred)
         output += 'PRED {}: {}\n'.format(sent_number, pred_sent)
-        output += "PRED SCORE: {:.4f}\n".format(best_score)
+        print("PRED SCORE: {:.4f}".format(best_score))
 
         if self.gold_sent is not None:
             tgt_sent = ' '.join(self.gold_sent)
             output += 'GOLD {}: {}\n'.format(sent_number, tgt_sent)
-            output += ("GOLD SCORE: {:.4f}\n".format(self.gold_score))
+            # output += ("GOLD SCORE: {:.4f}".format(self.gold_score))
+            print("GOLD SCORE: {:.4f}".format(self.gold_score))
         if len(self.pred_sents) > 1:
-            output += '\nBEST HYP:\n'
+            print('\nBEST HYP:')
             for score, sent in zip(self.pred_scores, self.pred_sents):
                 output += "[{:.4f}] {}\n".format(score, sent)
 
