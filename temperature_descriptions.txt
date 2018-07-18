@@ -1,0 +1,6 @@
+In order to run the decoder based on random sampling and using temperature to control the randomness of predictions, we need to change this two files of torch module:
+
+torch/nn/functional.py
+torch/nn/modules/activation.py
+
+which are included in this repo.
