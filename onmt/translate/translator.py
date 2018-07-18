@@ -292,14 +292,11 @@ class Translator(object):
 
         ## (3) run the decoder to generate sentences, using beam search.
         for i in range(self.max_length): 
-            #print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
-            #print("word "+ str(i))
             if all((b.done() for b in beam)): #if top of beam is eos 
                 break
     
             # Construct batch x beam_size nxt words.
             # Get all the pending current beam words and arrange
-            
             inp = var(torch.stack([b.get_current_state() for b in beam])
                           .t().contiguous().view(1, -1)) #inp [1*beam_size x batch_size]
         
@@ -322,13 +319,8 @@ class Translator(object):
             # (b) Compute a vector of batch x beam word scores.
             if not self.copy_attn:
                 out = self.model.generator.forward(dec_out).data
-                #print(out)
-                #print(out.exp().sum(dim = 1))
-                #print('probablities is ')
-                #print(out)
                 out = unbottle(out)
                 # beam x tgt_vocab
-                #size of out : x batch x vocab_size
     
                 beam_attn = unbottle(attn["std"])
             else:
@@ -347,7 +339,6 @@ class Translator(object):
     
             # (c) Advance each beam.
             for j, b in enumerate(beam):
-                #print("sentence "+ str(j))
                 b.advance(out[:, j],
                               beam_attn.data[:, j, :memory_lengths[j]],  self.stochastic)
                 dec_states.beam_update(j, b.get_current_origin(), beam_size)
@@ -373,9 +364,7 @@ class Translator(object):
                 hyp, att = b.get_hyp(times, k)
                 hyps.append(hyp)
                 attn.append(att)
-            #print(hyps)
-            #print(scores)
-            ret["predictions"].append(hyps) #predicted sent
+            ret["predictions"].append(hyps)
             ret["scores"].append(scores)
             ret["attention"].append(attn)
         return ret

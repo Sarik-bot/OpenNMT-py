@@ -86,8 +86,6 @@ class Beam(object):
         Returns: True if beam search is complete.
         """
         num_words = word_probs.size(1)
-        #print(word_probs)
-        #print(word_probs.exp().sum(dim = 1))   #it is 1           
 
         if self.stepwise_penalty:
             self.global_scorer.update_score(self, attn_out)
@@ -102,9 +100,7 @@ class Beam(object):
         if len(self.prev_ks) > 0: ##for second word and after that
             beam_scores = word_probs + \
                 self.scores.unsqueeze(1).expand_as(word_probs) 
-            #print(self.scores.unsqueeze(1).expand_as(word_probs))
-            #print("summing up")
-            #print(beam_scores)
+
             
             # Don't let EOS have children.
             ##It gives -1e20 to all words prob. 
@@ -145,24 +141,13 @@ class Beam(object):
             if sum1.numpy()  == Variable(torch.FloatTensor([0])).data.numpy():
                 best_scores_id = torch.multinomial(flat_beam_scores.exp().add_(0.001), self.size) 
                 ##best_scores = scores_weights.index(best_scores_id).log()   ##by taking log of score -1e20 which is because of next_ys = eos the result is going to be -inf 
-                best_scores = flat_beam_scores[best_scores_id]
-                #print(flat_beam_scores)                
-                #print('best score id ' + str(best_scores_id))
-                #print('best score '  +str(flat_beam_scores[best_scores_id]))
-                #print('best score ' + str(best_scores))                
+                best_scores = flat_beam_scores[best_scores_id]            
             
             else:   
                 best_scores_id = torch.multinomial(scores_weights, self.size) 
                 ##best_scores = torch.log(scores_weights.index(best_scores_id)) ##since we are taking exp for sampling we need to make the log
                 best_scores = flat_beam_scores[best_scores_id]
-                #print(flat_beam_scores)
-                #print(scores_weights.sum())                
-                #print(scores_weights)
-                #print('best score idd ' + str(best_scores_id))                
-                #print('best score '  +str(flat_beam_scores[best_scores_id]))
-                #print('best score ' + str(best_scores))
-                #print("min is "+ str(scores_weights.min()))
-                #print("max is "+ str(scores_weights.max()))                
+          
             
         else:
             best_scores, best_scores_id = flat_beam_scores.topk(self.size, 0,
@@ -172,12 +157,11 @@ class Beam(object):
 
         # best_scores_id is flattened beam x word array, so calculate which
         # word and beam each score came from
-        prev_k = best_scores_id / num_words ##???this is always 0
+        prev_k = best_scores_id / num_words 
         self.prev_ks.append(prev_k)
         self.next_ys.append((best_scores_id - prev_k * num_words))
         self.attn.append(attn_out.index_select(0, prev_k))
         self.global_scorer.update_global_state(self)
-        #print("next_ys " + str(best_scores_id - prev_k * num_words)) 
 
         for i in range(self.next_ys[-1].size(0)):
             if self.next_ys[-1][i] == self._eos: ##If the next_ys is <eos> the predicted sentence is done! (actually it calculates the next_ys untill the last word but after <eos>, it ignores the words after that in output)
